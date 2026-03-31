@@ -1,69 +1,68 @@
 // Arbitrage Calculator
-// Matches Polymarket binary markets with Binance futures and calculates profit opportunities
+// Matches Polymarket binary markets with Binance futures/options and calculates
+// real arbitrage opportunities using Black-Scholes implied probability.
 
 import { Logger } from '../utils/logger.js';
+import { impliedProbability, daysToYears } from './blackscholes.js';
+
+// Risk-free rate assumption (annualised) — US 3-month T-bill approximation
+const RISK_FREE_RATE = 0.05;
 
 export class ArbitrageService {
   constructor(polymarketService, binanceService, telegramService = null) {
     this.polymarketService = polymarketService;
     this.binanceService = binanceService;
-    this.telegramService = telegramService; // Optional for notifications
+    this.telegramService = telegramService;
 
-    // Fee constants (as percentages)
+    // Fee constants (as decimals)
     this.fees = {
-      polymarket: 0.025,    // 2.5% total Polymarket fees
-      binance: 0.0004,      // 0.04% Binance futures fees (round trip)
-      slippage: 0.001       // 0.1% slippage buffer
+      polymarket: 0.025,  // 2.5% total Polymarket fees
+      binance: 0.0004,    // 0.04% Binance futures fees (round trip)
+      slippage: 0.001     // 0.1% slippage buffer
     };
 
-    this.minProfitThreshold = 0.005; // 0.5% minimum profit
+    this.minProfitThreshold = 0.005; // 0.5% minimum net profit
   }
 
+  // ─── Public: main entry points ───────────────────────────────────────────────
+
   /**
-   * Match Polymarket binary markets with Binance futures prices
-   * @param {Array} polymarketMarkets - Array of Polymarket market objects
-   * @param {Array} binancePrices - Array of Binance price objects
-   * @returns {Array} Array of matched market opportunities
+   * Match Polymarket binary markets with Binance futures prices.
+   * For each matched market, attempts to derive a real Black-Scholes probability
+   * using Binance Options IV. Markets without extractable strike prices are skipped.
+   *
+   * @param {Array} polymarketMarkets
+   * @param {Array} binancePrices
+   * @returns {Array} Array of arbitrage opportunity objects
    */
   async matchMarkets(polymarketMarkets, binancePrices) {
     Logger.info('ARBITRAGE', `Matching ${polymarketMarkets.length} Polymarket markets with ${binancePrices.length} Binance prices`);
 
     const opportunities = [];
 
-    // Create price lookup map for faster access
+    // Build a fast symbol → price lookup
     const priceMap = new Map();
-    binancePrices.forEach(price => {
-      priceMap.set(price.symbol, price);
-    });
+    binancePrices.forEach(p => priceMap.set(p.symbol, p));
 
     for (const market of polymarketMarkets) {
       try {
-        // Only process binary markets
-        if (!this.isBinaryMarket(market)) {
-          continue;
-        }
+        if (!this.isBinaryMarket(market)) continue;
 
-        // Extract crypto symbol from market question
         const symbol = this.extractCryptoSymbol(market);
         if (!symbol) {
-          Logger.debug('ARBITRAGE', `Could not extract symbol from market: ${market.question}`);
+          Logger.debug('ARBITRAGE', `No crypto symbol found: "${market.question}"`);
           continue;
         }
 
-        // Map to Binance symbol (e.g., BTC -> BTCUSDT)
-        const binanceSymbol = this.mapToBinanceSymbol(symbol);
+        const binanceSymbol = `${symbol}USDT`;
         const futuresPrice = priceMap.get(binanceSymbol);
-
         if (!futuresPrice) {
-          Logger.debug('ARBITRAGE', `No Binance price found for ${binanceSymbol}`);
+          Logger.debug('ARBITRAGE', `No Binance price for ${binanceSymbol}`);
           continue;
         }
 
-        // Calculate arbitrage opportunity
-        const opportunity = await this.calculateArbitrage(market, futuresPrice);
-        if (opportunity) {
-          opportunities.push(opportunity);
-        }
+        const opportunity = await this.calculateArbitrage(market, futuresPrice, symbol);
+        if (opportunity) opportunities.push(opportunity);
 
       } catch (error) {
         Logger.warn('ARBITRAGE', `Error processing market ${market.id}: ${error.message}`);
@@ -75,9 +74,194 @@ export class ArbitrageService {
   }
 
   /**
-   * Check if market is a binary Yes/No market
-   * @param {Object} market - Polymarket market object
-   * @returns {boolean} True if binary market
+   * Filter opportunities by minimum profit threshold and dispatch Telegram alerts.
+   * @param {Array} opportunities
+   * @param {number} minThreshold
+   * @returns {Array} Filtered and sorted opportunities
+   */
+  async filterOpportunities(opportunities, minThreshold = this.minProfitThreshold) {
+    Logger.info('ARBITRAGE', `Filtering ${opportunities.length} opportunities (min ${minThreshold * 100}%)`);
+
+    const filtered = opportunities
+      .filter(opp => opp.arbitrage.profitMargin >= minThreshold)
+      .sort((a, b) => b.arbitrage.profitMargin - a.arbitrage.profitMargin);
+
+    Logger.info('ARBITRAGE', `${filtered.length} opportunities meet threshold`);
+
+    if (this.telegramService && filtered.length > 0) {
+      for (const opp of filtered) {
+        try {
+          await this.telegramService.sendArbitrageAlert(opp);
+        } catch (error) {
+          Logger.error('ARBITRAGE', `Telegram alert failed: ${error.message}`);
+        }
+      }
+    } else if (!this.telegramService && filtered.length > 0) {
+      Logger.warn('ARBITRAGE', `${filtered.length} opportunities found but no Telegram service configured`);
+    }
+
+    return filtered;
+  }
+
+  /**
+   * Summary statistics over an array of opportunities.
+   */
+  getStatistics(opportunities) {
+    if (opportunities.length === 0) {
+      return { total: 0, averageProfit: 0, highConfidence: 0, maxProfit: 0 };
+    }
+    const profits = opportunities.map(o => o.arbitrage.profitMargin);
+    return {
+      total: opportunities.length,
+      averageProfit: profits.reduce((s, p) => s + p, 0) / profits.length,
+      highConfidence: opportunities.filter(o => o.confidence === 'high').length,
+      maxProfit: Math.max(...profits)
+    };
+  }
+
+  // ─── Core arbitrage calculation ───────────────────────────────────────────────
+
+  /**
+   * Full arbitrage calculation for a single market.
+   *
+   * Flow:
+   *   1. Read Polymarket implied probability (Yes price)
+   *   2. Extract price target (K) from the question text
+   *   3. Fetch Binance Options IV for that strike/expiry → Black-Scholes prob
+   *   4. Compare the two probabilities, compute net profit after fees
+   *
+   * @param {Object} market        - Polymarket market object (with .probability)
+   * @param {Object} futuresPrice  - { symbol, price, timestamp }
+   * @param {string} underlying    - e.g. 'BTC', 'ETH'
+   * @returns {Object|null}
+   */
+  async calculateArbitrage(market, futuresPrice, underlying) {
+    try {
+      // ── Step 1: Polymarket implied probability ─────────────────────────────
+      const polymarketProb = market.probability;
+      if (polymarketProb === null || polymarketProb === undefined) return null;
+
+      // ── Step 2: Extract price target from question ─────────────────────────
+      const strikePrice = this.extractStrikePrice(market.question);
+      if (!strikePrice) {
+        Logger.debug('ARBITRAGE', `No strike price in question: "${market.question}"`);
+        return null;
+      }
+
+      const direction = this.determineMarketDirection(market);
+      if (!direction) {
+        Logger.debug('ARBITRAGE', `Cannot determine direction: "${market.question}"`);
+        return null;
+      }
+
+      const currentPrice = futuresPrice.price;
+      const expiry = market.expiresAt ? new Date(market.expiresAt) : null;
+
+      // ── Step 3: Black-Scholes probability via Binance Options IV ───────────
+      let bsProb = null;
+      let optionsData = null;
+
+      try {
+        optionsData = await this.binanceService.fetchOptionsData(underlying, expiry, strikePrice);
+      } catch (err) {
+        Logger.debug('ARBITRAGE', `Options fetch skipped for ${underlying}: ${err.message}`);
+      }
+
+      if (optionsData && optionsData.impliedVolatility) {
+        const T = expiry ? daysToYears(expiry) : daysToYears(new Date(Date.now() + 30 * 24 * 60 * 60 * 1000));
+        const sigma = optionsData.impliedVolatility;
+        const S = currentPrice;
+        const K = strikePrice;
+
+        bsProb = direction === 'bullish'
+          ? impliedProbability(S, K, T, RISK_FREE_RATE, sigma)          // P(S > K) at expiry
+          : impliedProbability(S, K, T, RISK_FREE_RATE, sigma) !== null  // P(S < K) = 1 - P(S > K)
+            ? 1 - impliedProbability(S, K, T, RISK_FREE_RATE, sigma)
+            : null;
+
+        if (bsProb !== null) {
+          Logger.info('ARBITRAGE',
+            `BS prob for ${underlying} strike=$${strikePrice} IV=${(sigma * 100).toFixed(1)}%: ` +
+            `${(bsProb * 100).toFixed(2)}% (Polymarket: ${(polymarketProb * 100).toFixed(2)}%)`
+          );
+        }
+      }
+
+      // ── Fallback: skip this market — we don't guess anymore ───────────────
+      if (bsProb === null) {
+        Logger.debug('ARBITRAGE',
+          `Skipping "${market.question}" — no Black-Scholes probability available`);
+        return null;
+      }
+
+      // ── Step 4: Probability delta and profit model ─────────────────────────
+      const probDelta = polymarketProb - bsProb;
+
+      if (Math.abs(probDelta) < 0.001) return null; // < 0.1% difference, not worth it
+
+      const positionSize = 1000; // $1,000 notional for calculation purposes
+      const grossProfit = Math.abs(probDelta) * positionSize;
+      const totalFees = positionSize * (this.fees.polymarket + this.fees.binance + this.fees.slippage);
+      const netProfit = grossProfit - totalFees;
+      const profitMargin = netProfit / positionSize;
+
+      if (profitMargin < this.minProfitThreshold) return null;
+
+      // ── Build opportunity object ───────────────────────────────────────────
+      const opportunity = {
+        market: {
+          id: market.id,
+          question: market.question,
+          probability: polymarketProb,
+          direction,
+          expiresAt: market.expiresAt
+        },
+        futures: {
+          symbol: futuresPrice.symbol,
+          price: currentPrice,
+          timestamp: futuresPrice.timestamp
+        },
+        options: optionsData ? {
+          symbol: optionsData.symbol,
+          strike: optionsData.strike,
+          expiry: optionsData.expiry,
+          impliedVolatility: optionsData.impliedVolatility,
+          markPrice: optionsData.markPrice
+        } : null,
+        arbitrage: {
+          polymarketProb,
+          bsProb,
+          probabilityDelta: probDelta,
+          grossProfit,
+          totalFees,
+          netProfit,
+          profitMargin,
+          positionSize
+        },
+        // Positive delta → Polymarket overprices Yes → sell Yes on Polymarket, buy on Binance
+        // Negative delta → Polymarket underprices Yes → buy Yes on Polymarket, hedge short on Binance
+        recommendation: probDelta > 0 ? 'SELL_POLYMARKET_YES' : 'BUY_POLYMARKET_YES',
+        confidence: this.calculateConfidence(probDelta, optionsData),
+        timestamp: Date.now()
+      };
+
+      Logger.debug('ARBITRAGE',
+        `Opportunity: "${market.question.substring(0, 60)}" | ` +
+        `Δ=${(probDelta * 100).toFixed(2)}pp | net=${(profitMargin * 100).toFixed(2)}%`
+      );
+
+      return opportunity;
+
+    } catch (error) {
+      Logger.warn('ARBITRAGE', `calculateArbitrage error for ${market.id}: ${error.message}`);
+      return null;
+    }
+  }
+
+  // ─── Helper methods ───────────────────────────────────────────────────────────
+
+  /**
+   * Check if a market is a binary Yes/No market.
    */
   isBinaryMarket(market) {
     return market.outcomes &&
@@ -88,41 +272,54 @@ export class ArbitrageService {
   }
 
   /**
-   * Extract cryptocurrency symbol from market question
-   * @param {Object} market - Polymarket market object
-   * @returns {string|null} Crypto symbol (BTC, ETH, etc.) or null
+   * Extract the primary cryptocurrency symbol from a Polymarket question.
+   * Returns the canonical ticker (BTC, ETH, SOL, etc.) or null.
    */
   extractCryptoSymbol(market) {
-    const question = market.question || '';
-    const text = question.toLowerCase();
+    const text = (market.question || '').toLowerCase();
 
-    // Common crypto symbols to look for
-    const cryptoPatterns = [
-      /\b(btc|bitcoin)\b/i,
-      /\b(eth|ethereum)\b/i,
-      /\b(sol|solana)\b/i,
-      /\b(ada|cardano)\b/i,
-      /\b(dot|polkadot)\b/i,
-      /\b(link|chainlink)\b/i,
-      /\b(uni|uniswap)\b/i,
-      /\b(aave)\b/i,
-      /\b(comp|compound)\b/i,
-      /\b(mkr|maker)\b/i
+    const patterns = [
+      [/\b(btc|bitcoin)\b/i, 'BTC'],
+      [/\b(eth|ethereum)\b/i, 'ETH'],
+      [/\b(sol|solana)\b/i, 'SOL'],
+      [/\b(ada|cardano)\b/i, 'ADA'],
+      [/\b(dot|polkadot)\b/i, 'DOT'],
+      [/\b(link|chainlink)\b/i, 'LINK'],
+      [/\b(uni|uniswap)\b/i, 'UNI'],
+      [/\b(aave)\b/i, 'AAVE'],
+      [/\b(comp|compound)\b/i, 'COMP'],
+      [/\b(mkr|maker)\b/i, 'MKR'],
     ];
 
-    for (const pattern of cryptoPatterns) {
-      const match = text.match(pattern);
+    for (const [pattern, ticker] of patterns) {
+      if (pattern.test(text)) return ticker;
+    }
+    return null;
+  }
+
+  /**
+   * Extract a dollar price target from a Polymarket question.
+   * e.g. "Will BTC reach $120,000 by April?" → 120000
+   * Returns null if no clear price target is found.
+   */
+  extractStrikePrice(question) {
+    if (!question) return null;
+
+    // Match patterns like $120k, $120,000, $120000, $1.2m, $1.2M
+    const patterns = [
+      /\$(\d[\d,]*\.?\d*)\s*[Mm]/,   // $1.2m or $120M
+      /\$(\d[\d,]*\.?\d*)\s*[Kk]/,   // $120k or $120K
+      /\$(\d[\d,]*)/,                  // $120,000 or $120000
+    ];
+
+    for (const pattern of patterns) {
+      const match = question.match(pattern);
       if (match) {
-        const symbol = match[1].toUpperCase();
-        // Normalize common variations
-        if (symbol === 'BITCOIN') return 'BTC';
-        if (symbol === 'ETHEREUM') return 'ETH';
-        if (symbol === 'SOLANA') return 'SOL';
-        if (symbol === 'CARDANO') return 'ADA';
-        if (symbol === 'POLKADOT') return 'DOT';
-        if (symbol === 'CHAINLINK') return 'LINK';
-        if (symbol === 'UNISWAP') return 'UNI';
-        return symbol;
+        let value = parseFloat(match[1].replace(/,/g, ''));
+        // Apply multiplier suffix
+        if (/[Mm]/.test(match[0])) value *= 1_000_000;
+        if (/[Kk]/.test(match[0])) value *= 1_000;
+        if (value > 0) return value;
       }
     }
 
@@ -130,227 +327,35 @@ export class ArbitrageService {
   }
 
   /**
-   * Map crypto symbol to Binance futures symbol
-   * @param {string} symbol - Crypto symbol (BTC, ETH, etc.)
-   * @returns {string} Binance symbol (BTCUSDT, ETHUSDT, etc.)
-   */
-  mapToBinanceSymbol(symbol) {
-    return `${symbol}USDT`;
-  }
-
-  /**
-   * Calculate arbitrage opportunity for a market
-   * @param {Object} market - Polymarket market object
-   * @param {Object} futuresPrice - Binance price object
-   * @returns {Object|null} Arbitrage opportunity or null
-   */
-  async calculateArbitrage(market, futuresPrice) {
-    try {
-      // Get Polymarket probability (Yes outcome price)
-      const polymarketProb = market.probability;
-      if (polymarketProb === null || polymarketProb === undefined) {
-        return null;
-      }
-
-      // For binary markets, we need to determine if this is a "bullish" or "bearish" bet
-      // This is a simplified approach - in reality, we'd need to parse the question more carefully
-      const direction = this.determineMarketDirection(market);
-      if (!direction) {
-        Logger.debug('ARBITRAGE', `Could not determine direction for market: ${market.question}`);
-        return null;
-      }
-
-      // Get current futures price
-      const currentPrice = futuresPrice.price;
-
-      // Estimate futures probability based on market direction
-      // This is a simplified model - real arbitrage would need more sophisticated modeling
-      const futuresProb = this.estimateFuturesProbability(market, currentPrice, direction);
-
-      // Calculate probability delta
-      const probDelta = direction === 'bullish' ?
-        polymarketProb - futuresProb :
-        futuresProb - polymarketProb;
-
-      if (Math.abs(probDelta) < 0.001) { // Less than 0.1% difference
-        return null;
-      }
-
-      // Calculate profit potential (simplified model)
-      const positionSize = 1000; // $1000 position for calculation
-      const grossProfit = Math.abs(probDelta) * positionSize;
-
-      // Calculate total fees
-      const totalFees = positionSize * (this.fees.polymarket + this.fees.binance + this.fees.slippage);
-
-      // Calculate net profit
-      const netProfit = grossProfit - totalFees;
-      const profitMargin = netProfit / positionSize;
-
-      // Only return if profit margin meets minimum threshold
-      if (profitMargin < this.minProfitThreshold) {
-        return null;
-      }
-
-      const opportunity = {
-        market: {
-          id: market.id,
-          question: market.question,
-          probability: polymarketProb,
-          direction: direction,
-          expiresAt: market.expiresAt
-        },
-        futures: {
-          symbol: futuresPrice.symbol,
-          price: currentPrice,
-          timestamp: futuresPrice.timestamp
-        },
-        arbitrage: {
-          probabilityDelta: probDelta,
-          grossProfit: grossProfit,
-          totalFees: totalFees,
-          netProfit: netProfit,
-          profitMargin: profitMargin,
-          positionSize: positionSize
-        },
-        recommendation: direction === 'bullish' ? 'BUY' : 'SELL',
-        confidence: this.calculateConfidence(probDelta, market),
-        timestamp: Date.now()
-      };
-
-      Logger.debug('ARBITRAGE', `Found opportunity: ${market.question} - ${profitMargin.toFixed(2)}% profit`);
-      return opportunity;
-
-    } catch (error) {
-      Logger.warn('ARBITRAGE', `Error calculating arbitrage for market ${market.id}: ${error.message}`);
-      return null;
-    }
-  }
-
-  /**
-   * Determine if market is bullish or bearish based on question
-   * @param {Object} market - Polymarket market object
-   * @returns {string|null} 'bullish', 'bearish', or null
+   * Determine market direction from keyword analysis.
+   * Returns 'bullish' (P(above K)), 'bearish' (P(below K)), or null.
    */
   determineMarketDirection(market) {
-    const question = market.question.toLowerCase();
+    const q = (market.question || '').toLowerCase();
 
-    // Look for bullish indicators
-    const bullishKeywords = ['reach', 'above', 'over', 'higher than', 'surpass', 'exceed', 'break above'];
-    const bearishKeywords = ['below', 'under', 'lower than', 'drop below', 'fall below'];
+    const bullish = ['reach', 'above', 'over', 'higher than', 'surpass', 'exceed', 'break above', 'hit'];
+    const bearish  = ['below', 'under', 'lower than', 'drop below', 'fall below', 'drop to'];
 
-    const isBullish = bullishKeywords.some(keyword => question.includes(keyword));
-    const isBearish = bearishKeywords.some(keyword => question.includes(keyword));
+    const isBullish = bullish.some(kw => q.includes(kw));
+    const isBearish = bearish.some(kw => q.includes(kw));
 
     if (isBullish && !isBearish) return 'bullish';
     if (isBearish && !isBullish) return 'bearish';
-
-    // For ambiguous cases, check if it mentions a price target
-    const priceMatch = question.match(/\$[\d,]+/);
-    if (priceMatch) {
-      // If it mentions reaching a high price, assume bullish
-      if (question.includes('reach') || question.includes('above')) {
-        return 'bullish';
-      }
-    }
-
-    return null; // Could not determine direction
+    return null; // ambiguous — skip rather than guess
   }
 
   /**
-   * Estimate futures market probability (simplified model)
-   * @param {Object} market - Polymarket market object
-   * @param {number} currentPrice - Current futures price
-   * @param {string} direction - 'bullish' or 'bearish'
-   * @returns {number} Estimated probability (0-1)
+   * Confidence score based on probability delta magnitude and whether
+   * real options data backed the calculation.
    */
-  estimateFuturesProbability(market, currentPrice, direction) {
-    // This is a highly simplified model
-    // In a real implementation, this would use:
-    // - Black-Scholes option pricing
-    // - Historical volatility
-    // - Time to expiration
-    // - Risk-free rates
+  calculateConfidence(probDelta, optionsData) {
+    const delta = Math.abs(probDelta);
+    // Downgrade confidence if no real options data was available
+    const hasRealData = !!optionsData;
 
-    // For now, assume 50% probability as baseline
-    // Adjust based on how far we are from expiration
-    const now = new Date();
-    const expiry = market.expiresAt ? new Date(market.expiresAt) : new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-    const daysToExpiry = Math.max(1, (expiry - now) / (1000 * 60 * 60 * 24));
-
-    // Longer time horizons have more uncertainty (closer to 50%)
-    // Shorter time horizons reflect current market sentiment more
-    const timeAdjustment = Math.min(0.5, 30 / daysToExpiry);
-
-    return 0.5 + (direction === 'bullish' ? timeAdjustment : -timeAdjustment);
-  }
-
-  /**
-   * Calculate confidence level for the arbitrage opportunity
-   * @param {number} probDelta - Probability difference
-   * @param {Object} market - Market object
-   * @returns {string} Confidence level: 'low', 'medium', 'high'
-   */
-  calculateConfidence(probDelta, market) {
-    const absDelta = Math.abs(probDelta);
-
-    if (absDelta > 0.05) return 'high';      // >5% probability difference
-    if (absDelta > 0.02) return 'medium';    // >2% probability difference
-    return 'low';                            // <2% probability difference
-  }
-
-  /**
-   * Filter opportunities by minimum profit threshold and send notifications
-   * @param {Array} opportunities - Array of arbitrage opportunities
-   * @param {number} minThreshold - Minimum profit margin (default 2%)
-   * @returns {Array} Filtered and sorted opportunities
-   */
-  async filterOpportunities(opportunities, minThreshold = this.minProfitThreshold) {
-    Logger.info('ARBITRAGE', `Filtering ${opportunities.length} opportunities with ${minThreshold * 100}% minimum threshold`);
-
-    const filtered = opportunities
-      .filter(opp => opp.arbitrage.profitMargin >= minThreshold)
-      .sort((a, b) => b.arbitrage.profitMargin - a.arbitrage.profitMargin); // Sort by profit margin descending
-
-    Logger.info('ARBITRAGE', `Filtered to ${filtered.length} opportunities meeting threshold`);
-
-    // Send notifications for profitable opportunities
-    if (this.telegramService && filtered.length > 0) {
-      Logger.info('ARBITRAGE', `Sending ${filtered.length} Telegram notifications`);
-
-      for (const opportunity of filtered) {
-        try {
-          await this.telegramService.sendArbitrageAlert(opportunity);
-        } catch (error) {
-          Logger.error('ARBITRAGE', `Failed to send notification for opportunity: ${error.message}`);
-          // Continue with other notifications even if one fails
-        }
-      }
-    } else if (!this.telegramService && filtered.length > 0) {
-      Logger.warn('ARBITRAGE', `Found ${filtered.length} opportunities but no Telegram service configured`);
-    }
-
-    return filtered;
-  }
-
-  /**
-   * Get arbitrage statistics
-   * @param {Array} opportunities - Array of arbitrage opportunities
-   * @returns {Object} Statistics object
-   */
-  getStatistics(opportunities) {
-    if (opportunities.length === 0) {
-      return { total: 0, averageProfit: 0, highConfidence: 0, maxProfit: 0 };
-    }
-
-    const profits = opportunities.map(opp => opp.arbitrage.profitMargin);
-    const highConfidence = opportunities.filter(opp => opp.confidence === 'high').length;
-
-    return {
-      total: opportunities.length,
-      averageProfit: profits.reduce((sum, p) => sum + p, 0) / profits.length,
-      highConfidence: highConfidence,
-      maxProfit: Math.max(...profits)
-    };
+    if (!hasRealData) return 'low';
+    if (delta > 0.05) return 'high';    // > 5pp difference
+    if (delta > 0.02) return 'medium';  // > 2pp difference
+    return 'low';
   }
 }
